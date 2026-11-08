@@ -34,6 +34,13 @@ typedef struct { uint32_t offset; uint32_t bit; uint32_t value; } ff_stuck_t;
 typedef struct { uint32_t offset; uint32_t bit; } ff_flip_t;
 typedef struct { uint32_t limit; } ff_wear_t;
 
+/* Simulated chip timing. mode 0 = instant, 1 = erase blocks the chip for erase_us,
+ * 2 = erase is suspended at every slice_us boundary while a read is waiting. */
+#define FF_TIMING_INSTANT  0u
+#define FF_TIMING_BLOCKING 1u
+#define FF_TIMING_SUSPEND  2u
+typedef struct { uint32_t mode; uint32_t erase_us; uint32_t slice_us; uint32_t reserved; } ff_timing_t;
+
 typedef struct {
     uint64_t op_count;
     uint64_t reads;
@@ -47,7 +54,9 @@ typedef struct {
     uint32_t last_op_kind;
     uint32_t last_op_offset;
     uint32_t last_op_len;
-    uint32_t reserved;
+    uint32_t peak_handlers;   /* most requests the driver has had in flight at once */
+    uint32_t distinct_threads;/* how many different server threads have handled requests */
+    uint32_t pad2;
 } ff_stats_t;
 
 #define FF_DCMD_GEOMETRY      __DIOF(_DCMD_MISC, 0x100, ff_geometry_t)
@@ -60,5 +69,6 @@ typedef struct {
 #define FF_DCMD_STUCK_BIT     __DIOT(_DCMD_MISC, 0x107, ff_stuck_t)
 #define FF_DCMD_FLIP_BIT      __DIOT(_DCMD_MISC, 0x108, ff_flip_t)
 #define FF_DCMD_WEAR_LIMIT    __DIOT(_DCMD_MISC, 0x109, ff_wear_t)
+#define FF_DCMD_TIMING        __DIOT(_DCMD_MISC, 0x10A, ff_timing_t)
 
 #endif
