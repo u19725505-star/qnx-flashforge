@@ -6,4 +6,5 @@ qcc -Vgcc_ntox86_64 -Wall -O2 -Iinclude -Isrc -o build/flashforged src/flashforg
 qcc -Vgcc_ntox86_64 -Wall -O2 -Iinclude -o build/ff_test tests/ff_test.c
 qcc -Vgcc_ntox86_64 -Wall -O2 -Iinclude -o build/ff_fault_test tests/ff_fault_test.c
 qcc -Vgcc_ntox86_64 -Wall -O2 -Iinclude -o build/ff_campaign tests/ff_campaign.c
-echo "built: flashforged ff_test ff_fault_test ff_campaign"
+qcc -Vgcc_ntox86_64 -Wall -O2 -Iinclude -o build/ff_rt_demo tests/ff_rt_demo.c
+echo "built: flashforged ff_test ff_fault_test ff_campaign ff_rt_demo"
