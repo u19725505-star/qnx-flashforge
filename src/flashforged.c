@@ -7,12 +7,27 @@
 #include <sys/stat.h>
 #include <sys/iofunc.h>
 #include <sys/dispatch.h>
+#include <pthread.h>
+#include <unistd.h>
 #include <devctl.h>
 #include "ff_ioctl.h"
-#include "ff_core.h"
+#include "ff_chip.h"
 
-static ff_core_t core;
-static uint8_t   rbuf[65536];
+/* one reply buffer per server thread: the reply is sent by the same thread after the handler returns */
+static __thread uint8_t rbuf[16384];
+
+#define FF_SERVER_THREADS 6
+
+static void *server_thread(void *arg)
+{
+    dispatch_t *dpp = (dispatch_t *)arg;
+    dispatch_context_t *ctx = dispatch_context_alloc(dpp);
+    for (;;) {
+        ctx = dispatch_block(ctx);
+        if (ctx == NULL) { perror("dispatch_block"); return NULL; }
+        dispatch_handler(ctx);
+    }
+}
 
 static resmgr_connect_funcs_t connect_funcs;
 static resmgr_io_funcs_t      io_funcs;
@@ -34,7 +49,12 @@ static int io_read(resmgr_context_t *ctp, io_read_t *msg, iofunc_ocb_t *ocb)
         _IO_SET_READ_NBYTES(ctp, 0);
         return _RESMGR_NPARTS(0);
     }
-    int rc = ff_core_read(&core, (uint32_t)off, rbuf, (uint32_t)n);
+    /* The framework holds this resource's attribute lock while a handler runs, which would let only one
+     * request run at a time. The chip has its own lock, so release the attribute lock around the part
+     * that can block, and take it again before returning (allowed by the QNX docs). */
+    iofunc_attr_unlock(ocb->attr);
+    int rc = ff_chip_read((uint32_t)off, rbuf, (uint32_t)n);
+    iofunc_attr_lock(ocb->attr);
     if (rc != 0) return rc;
 
     _IO_SET_READ_NBYTES(ctp, n);
@@ -62,7 +82,7 @@ static int io_write(resmgr_context_t *ctp, io_write_t *msg, iofunc_ocb_t *ocb)
         if (c > sizeof(buf)) c = sizeof(buf);
         ssize_t got = resmgr_msgread(ctp, buf, c, sizeof(msg->i) + done);
         if (got != (ssize_t)c) return EIO;
-        int rc = ff_core_program(&core, (uint32_t)off + (uint32_t)done, buf, (uint32_t)c);
+        int rc = ff_chip_program((uint32_t)off + (uint32_t)done, buf, (uint32_t)c);
         if (rc != 0) return rc;
         done += c;
     }
@@ -109,49 +129,69 @@ static int io_devctl(resmgr_context_t *ctp, io_devctl_t *msg, iofunc_ocb_t *ocb)
     case FF_DCMD_ERASE: {
         ff_erase_t er;
         memcpy(&er, data, sizeof(er));
-        rc = ff_core_erase(&core, er.sector);
+        iofunc_attr_unlock(ocb->attr);      /* an erase can take many milliseconds: let other requests run */
+        rc = ff_chip_erase(er.sector);
+        iofunc_attr_lock(ocb->attr);
         if (rc != 0) return rc;
         return reply_none(ctp, msg);
     }
     case FF_DCMD_STATS: {
         ff_stats_t st;
-        ff_core_stats(&core, &st);
+        ff_chip_stats(&st);
         memcpy(data, &st, sizeof(st));
         return reply_data(ctp, msg, sizeof(st));
     }
     case FF_DCMD_RESET_ALL:
-        ff_core_reset(&core);
+        ff_chip_reset();
         return reply_none(ctp, msg);
     case FF_DCMD_FAULT_CLEAR:
-        ff_core_fault_clear(&core);
+        ff_chip_lock();
+        ff_core_fault_clear(&g_core);
+        ff_chip_unlock();
         return reply_none(ctp, msg);
     case FF_DCMD_POWER_CUT: {
         ff_powercut_t pc;
         memcpy(&pc, data, sizeof(pc));
-        ff_core_power_cut(&core, pc.after_ops, pc.seed);
+        ff_chip_lock();
+        ff_core_power_cut(&g_core, pc.after_ops, pc.seed);
+        ff_chip_unlock();
         return reply_none(ctp, msg);
     }
     case FF_DCMD_POWER_RESTORE:
-        ff_core_power_restore(&core);
+        ff_chip_lock();
+        ff_core_power_restore(&g_core);
+        ff_chip_unlock();
         return reply_none(ctp, msg);
     case FF_DCMD_STUCK_BIT: {
         ff_stuck_t sb;
         memcpy(&sb, data, sizeof(sb));
-        rc = ff_core_stuck(&core, sb.offset, sb.bit, sb.value);
+        ff_chip_lock();
+        rc = ff_core_stuck(&g_core, sb.offset, sb.bit, sb.value);
+        ff_chip_unlock();
         if (rc != 0) return rc;
         return reply_none(ctp, msg);
     }
     case FF_DCMD_FLIP_BIT: {
         ff_flip_t fl;
         memcpy(&fl, data, sizeof(fl));
-        rc = ff_core_flip(&core, fl.offset, fl.bit);
+        ff_chip_lock();
+        rc = ff_core_flip(&g_core, fl.offset, fl.bit);
+        ff_chip_unlock();
         if (rc != 0) return rc;
         return reply_none(ctp, msg);
     }
     case FF_DCMD_WEAR_LIMIT: {
         ff_wear_t w;
         memcpy(&w, data, sizeof(w));
-        core.wear_limit = w.limit;
+        ff_chip_lock();
+        g_core.wear_limit = w.limit;
+        ff_chip_unlock();
+        return reply_none(ctp, msg);
+    }
+    case FF_DCMD_TIMING: {
+        ff_timing_t t;
+        memcpy(&t, data, sizeof(t));
+        ff_chip_set_timing(&t);
         return reply_none(ctp, msg);
     }
     default:
@@ -161,7 +201,7 @@ static int io_devctl(resmgr_context_t *ctp, io_devctl_t *msg, iofunc_ocb_t *ocb)
 
 int main(void)
 {
-    ff_core_reset(&core);
+    ff_chip_init();
 
     dispatch_t *dpp = dispatch_create();
     if (dpp == NULL) { perror("dispatch_create"); return 1; }
@@ -186,13 +226,19 @@ int main(void)
         return 1;
     }
 
-    printf("flashforged: %s ready (%u KiB, %u-byte sectors, fault engine on)\n",
+    printf("flashforged: %s ready (%u KiB, %u-byte sectors, fault engine on, multithreaded)\n",
            FF_DEV_PATH, FF_FLASH_BYTES / 1024u, FF_SECTOR_BYTES);
+    fflush(stdout);
 
-    dispatch_context_t *ctx = dispatch_context_alloc(dpp);
-    for (;;) {
-        ctx = dispatch_block(ctx);
-        if (ctx == NULL) { perror("dispatch_block"); return 1; }
-        dispatch_handler(ctx);
+    /* Several server threads, each waiting for messages on the same channel. QNX runs each handler at
+     * the priority of the client that sent the message, so a high-priority reader is served at high
+     * priority even while a low-priority client is in the middle of a slow erase. */
+    {
+        int i;
+        pthread_t tid;
+        for (i = 0; i < FF_SERVER_THREADS; i++) {
+            if (pthread_create(&tid, NULL, server_thread, dpp) != 0) { perror("pthread_create"); return 1; }
+        }
     }
+    for (;;) pause();   /* the main thread has nothing left to do */
 }
